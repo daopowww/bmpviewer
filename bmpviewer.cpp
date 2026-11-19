@@ -4,6 +4,7 @@
 #include "framework.h"
 #include "bmpviewer.h"
 #include <commdlg.h>
+#include <windowsx.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -25,6 +26,11 @@ HBITMAP loadedMask = nullptr;
 int imageWidth = 0;
 int imageHeight = 0;
 
+int imageRightOffset = IMAGE_MARGIN;
+int imageTopOffset = IMAGE_MARGIN;
+bool dragging = false;
+POINT dragOffset = {};
+
 // Глобальные переменные:
 HINSTANCE hInst;                                // текущий экземпляр
 WCHAR szTitle[MAX_LOADSTRING];                  // Текст строки заголовка
@@ -37,6 +43,10 @@ LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 void OpenBitmapFile(HWND hWnd);
 void DrawBitmap(HWND hWnd, HDC hdc);
+POINT GetImagePosition(HWND hWnd);
+bool HitTestImage(HWND hWnd, int mouseX, int mouseY);
+void StopDragging(HWND hWnd);
+void MoveImage(HWND hWnd, int mouseX, int mouseY);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -368,6 +378,7 @@ bool PrepareBitmap(HWND hWnd, HBITMAP source, const BITMAP& sourceInfo,
 // Выбор и загрузка BMP. Старое изображение заменяется после успешной загрузки.
 void OpenBitmapFile(HWND hWnd)
 {
+    StopDragging(hWnd);
     wchar_t fileName[32768] = {};
 
     OPENFILENAMEW dialog = {};
@@ -434,8 +445,92 @@ void OpenBitmapFile(HWND hWnd)
     loadedMask = newMask;
     imageWidth = newWidth;
     imageHeight = newHeight;
+    imageRightOffset = IMAGE_MARGIN;
+    imageTopOffset = IMAGE_MARGIN;
 
     InvalidateRect(hWnd, nullptr, TRUE);
+}
+
+// После перетаскивания сохраняются новые отступы от правого и верхнего краёв.
+POINT GetImagePosition(HWND hWnd)
+{
+    RECT clientRect = {};
+    GetClientRect(hWnd, &clientRect);
+    const int clientWidth = clientRect.right;
+    const int clientHeight = clientRect.bottom;
+    const int maxX = (std::max)(0, clientWidth - imageWidth);
+    const int maxY = (std::max)(0, clientHeight - imageHeight);
+
+    POINT position = {};
+    position.x = (std::min)(maxX,
+        (std::max)(0, clientWidth - imageWidth - imageRightOffset));
+    position.y = (std::min)(maxY, imageTopOffset);
+    return position;
+}
+
+// Учитываем маску, чтобы захватывать мышью видимые пиксели фигуры.
+bool HitTestImage(HWND hWnd, int mouseX, int mouseY)
+{
+    if (!loadedBitmap || !loadedMask)
+    {
+        return false;
+    }
+
+    const POINT position = GetImagePosition(hWnd);
+    const int x = mouseX - position.x;
+    const int y = mouseY - position.y;
+    if (x < 0 || y < 0 || x >= imageWidth || y >= imageHeight)
+    {
+        return false;
+    }
+
+    HDC memoryDC = CreateCompatibleDC(nullptr);
+    if (!memoryDC)
+    {
+        return false;
+    }
+    HGDIOBJ previousBitmap = SelectObject(memoryDC, loadedMask);
+    if (!previousBitmap || previousBitmap == HGDI_ERROR)
+    {
+        DeleteDC(memoryDC);
+        return false;
+    }
+
+    const COLORREF pixel = GetPixel(memoryDC, x, y);
+    SelectObject(memoryDC, previousBitmap);
+    DeleteDC(memoryDC);
+    return pixel == RGB(0, 0, 0);
+}
+
+void StopDragging(HWND hWnd)
+{
+    dragging = false;
+    if (GetCapture() == hWnd)
+    {
+        ReleaseCapture();
+    }
+}
+
+void MoveImage(HWND hWnd, int mouseX, int mouseY)
+{
+    RECT clientRect = {};
+    GetClientRect(hWnd, &clientRect);
+    const int clientWidth = clientRect.right;
+    const int clientHeight = clientRect.bottom;
+    const int maxX = (std::max)(0, clientWidth - imageWidth);
+    const int maxY = (std::max)(0, clientHeight - imageHeight);
+    const int x = (std::min)(maxX,
+        (std::max)(0, mouseX - static_cast<int>(dragOffset.x)));
+    const int y = (std::min)(maxY,
+        (std::max)(0, mouseY - static_cast<int>(dragOffset.y)));
+    const POINT oldPosition = GetImagePosition(hWnd);
+
+    imageRightOffset = (std::max)(0, clientWidth - imageWidth - x);
+    imageTopOffset = y;
+    if (oldPosition.x != x || oldPosition.y != y)
+    {
+        InvalidateRect(hWnd, nullptr, TRUE);
+    }
 }
 
 // Положение пересчитывается при каждой перерисовке окна.
@@ -467,20 +562,14 @@ void DrawBitmap(HWND hWnd, HDC hdc)
         return;
     }
 
-    RECT clientRect = {};
-    GetClientRect(hWnd, &clientRect);
-    int x = clientRect.right - imageWidth - IMAGE_MARGIN;
-    if (x < 0)
-    {
-        x = 0;
-    }
+    const POINT position = GetImagePosition(hWnd);
 
     // Маска оставляет фон окна и очищает область фигуры.
-    BitBlt(hdc, x, IMAGE_MARGIN, imageWidth, imageHeight,
+    BitBlt(hdc, position.x, position.y, imageWidth, imageHeight,
         memoryDC, 0, 0, SRCAND);
     SelectObject(memoryDC, loadedBitmap);
     // Добавляем пиксели фигуры и надпись в очищенную область.
-    BitBlt(hdc, x, IMAGE_MARGIN, imageWidth, imageHeight,
+    BitBlt(hdc, position.x, position.y, imageWidth, imageHeight,
         memoryDC, 0, 0, SRCPAINT);
 
     SelectObject(memoryDC, previousBitmap);
@@ -542,10 +631,52 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             EndPaint(hWnd, &ps);
         }
         break;
+    case WM_LBUTTONDOWN:
+        {
+            const int x = GET_X_LPARAM(lParam);
+            const int y = GET_Y_LPARAM(lParam);
+            if (HitTestImage(hWnd, x, y))
+            {
+                const POINT position = GetImagePosition(hWnd);
+                dragOffset.x = x - position.x;
+                dragOffset.y = y - position.y;
+                SetCapture(hWnd);
+                dragging = GetCapture() == hWnd;
+            }
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (dragging)
+        {
+            if (wParam & MK_LBUTTON)
+            {
+                MoveImage(hWnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            }
+            else
+            {
+                StopDragging(hWnd);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (dragging)
+        {
+            MoveImage(hWnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            StopDragging(hWnd);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        dragging = false;
+        return 0;
+    case WM_CANCELMODE:
+        StopDragging(hWnd);
+        return 0;
     case WM_SIZE:
+        StopDragging(hWnd);
         InvalidateRect(hWnd, nullptr, TRUE);
         return 0;
     case WM_DESTROY:
+        StopDragging(hWnd);
         if (loadedBitmap)
         {
             DeleteObject(loadedBitmap);
