@@ -162,7 +162,11 @@
             "c:\\program files\\microsoft visual studio\\18\\community\\vc\\tools\\msvc\\14.52.37025\\include\\zmmintrin.h",
             "c:\\program files\\microsoft visual studio\\18\\community\\vc\\tools\\msvc\\14.52.37025\\include\\ammintrin.h",
             "e:\\projects\\bmpviewer\\bmpviewer\\bmpviewer.h",
-            "e:\\projects\\bmpviewer\\bmpviewer\\resource.h"
+            "e:\\projects\\bmpviewer\\bmpviewer\\resource.h",
+            "c:\\program files (x86)\\windows kits\\10\\include\\10.0.26100.0\\um\\commdlg.h",
+            "c:\\program files (x86)\\windows kits\\10\\include\\10.0.26100.0\\um\\prsht.h",
+            "c:\\program files (x86)\\windows kits\\10\\include\\10.0.26100.0\\shared\\pshpack8.h",
+            "c:\\program files (x86)\\windows kits\\10\\include\\10.0.26100.0\\shared\\poppack.h"
         ],
         "ImportedModules": [],
         "ImportedHeaderUnits": []

@@ -3,8 +3,18 @@
 
 #include "framework.h"
 #include "bmpviewer.h"
+#include <commdlg.h>
+
+#pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "Gdi32.lib")
 
 #define MAX_LOADSTRING 100
+
+constexpr UINT ID_OPEN_BMP = 50001;
+constexpr int IMAGE_MARGIN = 20;
+
+HBITMAP loadedBitmap = nullptr;
+BITMAP bitmapInfo = {};
 
 // Глобальные переменные:
 HINSTANCE hInst;                                // текущий экземпляр
@@ -16,6 +26,8 @@ ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
+void OpenBitmapFile(HWND hWnd);
+void DrawBitmap(HWND hWnd, HDC hdc);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -111,6 +123,97 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    return TRUE;
 }
 
+// Выбор и загрузка BMP. Старое изображение заменяется после успешной загрузки.
+void OpenBitmapFile(HWND hWnd)
+{
+    wchar_t fileName[32768] = {};
+
+    OPENFILENAMEW dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = hWnd;
+    dialog.lpstrFilter = L"Изображения BMP (*.bmp)\0*.bmp\0Все файлы (*.*)\0*.*\0";
+    dialog.lpstrFile = fileName;
+    dialog.nMaxFile = ARRAYSIZE(fileName);
+    dialog.lpstrTitle = L"Выберите изображение BMP";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (!GetOpenFileNameW(&dialog))
+    {
+        if (CommDlgExtendedError() != 0)
+        {
+            MessageBoxW(hWnd, L"Не удалось открыть диалог выбора файла.",
+                L"Ошибка", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    HBITMAP newBitmap = static_cast<HBITMAP>(LoadImageW(
+        nullptr, fileName, IMAGE_BITMAP, 0, 0,
+        LR_LOADFROMFILE | LR_CREATEDIBSECTION));
+
+    if (!newBitmap)
+    {
+        MessageBoxW(hWnd, L"Не удалось загрузить BMP. Проверьте формат файла.",
+            L"Ошибка загрузки", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    BITMAP newBitmapInfo = {};
+    if (GetObjectW(newBitmap, sizeof(newBitmapInfo), &newBitmapInfo) == 0
+        || newBitmapInfo.bmWidth <= 0 || newBitmapInfo.bmHeight <= 0)
+    {
+        DeleteObject(newBitmap);
+        MessageBoxW(hWnd, L"Не удалось определить размеры изображения.",
+            L"Ошибка загрузки", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    if (loadedBitmap)
+    {
+        DeleteObject(loadedBitmap);
+    }
+    loadedBitmap = newBitmap;
+    bitmapInfo = newBitmapInfo;
+
+    InvalidateRect(hWnd, nullptr, TRUE);
+}
+
+// Положение пересчитывается при каждой перерисовке окна.
+void DrawBitmap(HWND hWnd, HDC hdc)
+{
+    if (!loadedBitmap)
+    {
+        return;
+    }
+
+    HDC memoryDC = CreateCompatibleDC(hdc);
+    if (!memoryDC)
+    {
+        return;
+    }
+
+    HGDIOBJ previousBitmap = SelectObject(memoryDC, loadedBitmap);
+    if (!previousBitmap || previousBitmap == HGDI_ERROR)
+    {
+        DeleteDC(memoryDC);
+        return;
+    }
+
+    RECT clientRect = {};
+    GetClientRect(hWnd, &clientRect);
+    int x = clientRect.right - bitmapInfo.bmWidth - IMAGE_MARGIN;
+    if (x < 0)
+    {
+        x = 0;
+    }
+
+    BitBlt(hdc, x, IMAGE_MARGIN, bitmapInfo.bmWidth, bitmapInfo.bmHeight,
+        memoryDC, 0, 0, SRCCOPY);
+
+    SelectObject(memoryDC, previousBitmap);
+    DeleteDC(memoryDC);
+}
+
 //
 //  ФУНКЦИЯ: WndProc(HWND, UINT, WPARAM, LPARAM)
 //
@@ -125,12 +228,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
+    case WM_CREATE:
+        {
+            HMENU fileMenu = GetSubMenu(GetMenu(hWnd), 0);
+            if (!fileMenu || !InsertMenuW(fileMenu, 0,
+                MF_BYPOSITION | MF_STRING, ID_OPEN_BMP, L"Открыть BMP..."))
+            {
+                MessageBoxW(hWnd, L"Не удалось добавить команду открытия файла.",
+                    L"Ошибка", MB_OK | MB_ICONERROR);
+                return -1;
+            }
+            DrawMenuBar(hWnd);
+        }
+        return 0;
     case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
             // Разобрать выбор в меню:
             switch (wmId)
             {
+            case ID_OPEN_BMP:
+                OpenBitmapFile(hWnd);
+                break;
             case IDM_ABOUT:
                 DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
                 break;
@@ -145,12 +264,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_PAINT:
         {
             PAINTSTRUCT ps;
-            BeginPaint(hWnd, &ps);
-            // TODO: Добавьте сюда любой код рисования...
+            HDC hdc = BeginPaint(hWnd, &ps);
+            DrawBitmap(hWnd, hdc);
             EndPaint(hWnd, &ps);
         }
         break;
+    case WM_SIZE:
+        InvalidateRect(hWnd, nullptr, TRUE);
+        return 0;
     case WM_DESTROY:
+        if (loadedBitmap)
+        {
+            DeleteObject(loadedBitmap);
+            loadedBitmap = nullptr;
+        }
         PostQuitMessage(0);
         break;
     default:
