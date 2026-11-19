@@ -7,10 +7,12 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "Comdlg32.lib")
@@ -47,6 +49,7 @@ POINT GetImagePosition(HWND hWnd);
 bool HitTestImage(HWND hWnd, int mouseX, int mouseY);
 void StopDragging(HWND hWnd);
 void MoveImage(HWND hWnd, int mouseX, int mouseY);
+void ChooseFigureColor(HWND hWnd);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -142,13 +145,23 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    return TRUE;
 }
 
+struct FigureColors
+{
+    std::uint32_t fill = 0;
+    std::uint32_t text = 0;
+};
+
 struct ProcessedImage
 {
-    int width;
-    int height;
+    int width = 0;
+    int height = 0;
     std::vector<std::uint32_t> colors;
     std::vector<std::uint32_t> mask;
+    FigureColors palette;
 };
+
+ProcessedImage originalImage;
+std::uint32_t displayedFigureColor = 0;
 
 ProcessedImage RemoveOuterBackground(
     const std::vector<std::uint32_t>& pixels, int width, int height)
@@ -287,9 +300,185 @@ ProcessedImage RemoveOuterBackground(
     return result;
 }
 
+// Основной цвет определяется по непрозрачным пикселям исходной фигуры.
+FigureColors DetectFigureColors(const ProcessedImage& image)
+{
+    std::unordered_map<std::uint32_t, std::size_t> counts;
+    for (std::size_t i = 0; i < image.colors.size(); ++i)
+    {
+        if (image.mask[i] == 0)
+        {
+            ++counts[image.colors[i]];
+        }
+    }
+    if (counts.empty())
+    {
+        throw std::invalid_argument("The image has no visible pixels");
+    }
+
+    FigureColors result;
+    std::size_t largestCount = 0;
+    for (const auto& entry : counts)
+    {
+        if (entry.second > largestCount)
+        {
+            result.fill = entry.first;
+            largestCount = entry.second;
+        }
+    }
+
+    result.text = result.fill;
+    largestCount = 0;
+    for (const auto& entry : counts)
+    {
+        if (entry.first != result.fill && entry.second > largestCount)
+        {
+            result.text = entry.first;
+            largestCount = entry.second;
+        }
+    }
+    return result;
+}
+
+// Каждый выбор цвета рассчитывается по исходному изображению.
+std::vector<std::uint32_t> RecolorImage(
+    const ProcessedImage& image, std::uint32_t newFill)
+{
+    std::vector<std::uint32_t> result = image.colors;
+    const std::uint32_t fill = image.palette.fill;
+    if (newFill == fill)
+    {
+        return result;
+    }
+    const std::uint32_t text = image.palette.text;
+    double fillChannels[3];
+    double textChannels[3];
+    double newChannels[3];
+    double direction[3];
+    double lengthSquared = 0;
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const int shift = 16 - channel * 8;
+        fillChannels[channel] = (fill >> shift) & 255u;
+        textChannels[channel] = (text >> shift) & 255u;
+        newChannels[channel] = (newFill >> shift) & 255u;
+        direction[channel] = textChannels[channel] - fillChannels[channel];
+        lengthSquared += direction[channel] * direction[channel];
+    }
+
+    for (std::size_t i = 0; i < result.size(); ++i)
+    {
+        if (image.mask[i] != 0)
+        {
+            continue;
+        }
+        const std::uint32_t pixel = image.colors[i];
+        if (pixel == fill)
+        {
+            result[i] = newFill;
+            continue;
+        }
+        if (pixel == text || lengthSquared == 0)
+        {
+            continue;
+        }
+
+        // Сглаженные края букв содержат смесь цвета текста и заливки.
+        double channels[3];
+        double projection = 0;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            channels[channel] = (pixel >> (16 - channel * 8)) & 255u;
+            projection += (channels[channel] - fillChannels[channel])
+                * direction[channel];
+        }
+        const double textWeight = projection / lengthSquared;
+        if (textWeight < 0 || textWeight > 1)
+        {
+            continue;
+        }
+
+        bool isBlendedText = true;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const double expected = fillChannels[channel]
+                + textWeight * direction[channel];
+            if (std::abs(channels[channel] - expected) > 2.0)
+            {
+                isBlendedText = false;
+                break;
+            }
+        }
+        if (!isBlendedText)
+        {
+            continue;
+        }
+
+        std::uint32_t blended = 0;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const double value = newChannels[channel] * (1 - textWeight)
+                + textChannels[channel] * textWeight;
+            blended |= static_cast<std::uint32_t>(std::lround(value))
+                << (16 - channel * 8);
+        }
+        result[i] = blended;
+    }
+    return result;
+}
+
+void ChooseFigureColor(HWND hWnd)
+{
+    StopDragging(hWnd);
+    static COLORREF customColors[16] = {};
+    CHOOSECOLORW dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = hWnd;
+    dialog.lpCustColors = customColors;
+    dialog.rgbResult = RGB((displayedFigureColor >> 16) & 255u,
+        (displayedFigureColor >> 8) & 255u, displayedFigureColor & 255u);
+    dialog.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&dialog))
+    {
+        if (CommDlgExtendedError() != 0)
+        {
+            MessageBoxW(hWnd, L"Не удалось открыть диалог выбора цвета.",
+                L"Ошибка", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    const std::uint32_t newColor =
+        (static_cast<std::uint32_t>(GetRValue(dialog.rgbResult)) << 16)
+        | (static_cast<std::uint32_t>(GetGValue(dialog.rgbResult)) << 8)
+        | GetBValue(dialog.rgbResult);
+    try
+    {
+        const auto pixels = RecolorImage(originalImage, newColor);
+        DIBSECTION section = {};
+        if (GetObjectW(loadedBitmap, sizeof(section), &section) == 0
+            || !section.dsBm.bmBits)
+        {
+            throw std::runtime_error("Cannot access bitmap pixels");
+        }
+        GdiFlush();
+        std::memcpy(section.dsBm.bmBits, pixels.data(),
+            pixels.size() * sizeof(std::uint32_t));
+        displayedFigureColor = newColor;
+    }
+    catch (const std::exception&)
+    {
+        MessageBoxW(hWnd, L"Не удалось изменить цвет фигуры.",
+            L"Ошибка", MB_OK | MB_ICONERROR);
+        return;
+    }
+    InvalidateRect(hWnd, nullptr, TRUE);
+}
+
 // Приводим пиксели к 32 битам и создаём изображение с маской прозрачности.
 bool PrepareBitmap(HWND hWnd, HBITMAP source, const BITMAP& sourceInfo,
-    HBITMAP& colorBitmap, HBITMAP& maskBitmap, int& width, int& height)
+    HBITMAP& colorBitmap, HBITMAP& maskBitmap, int& width, int& height,
+    ProcessedImage& savedImage)
 {
     ProcessedImage image;
     try
@@ -326,6 +515,7 @@ bool PrepareBitmap(HWND hWnd, HBITMAP source, const BITMAP& sourceInfo,
 
         image = RemoveOuterBackground(pixels,
             sourceInfo.bmWidth, sourceInfo.bmHeight);
+        image.palette = DetectFigureColors(image);
     }
     catch (const std::exception&)
     {
@@ -372,6 +562,7 @@ bool PrepareBitmap(HWND hWnd, HBITMAP source, const BITMAP& sourceInfo,
     maskBitmap = newMask;
     width = image.width;
     height = image.height;
+    savedImage = std::move(image);
     return true;
 }
 
@@ -425,8 +616,9 @@ void OpenBitmapFile(HWND hWnd)
     HBITMAP newMask = nullptr;
     int newWidth = 0;
     int newHeight = 0;
+    ProcessedImage newOriginal;
     const bool prepared = PrepareBitmap(hWnd, newBitmap, newBitmapInfo,
-        newColor, newMask, newWidth, newHeight);
+        newColor, newMask, newWidth, newHeight, newOriginal);
     DeleteObject(newBitmap);
     if (!prepared)
     {
@@ -445,6 +637,8 @@ void OpenBitmapFile(HWND hWnd)
     loadedMask = newMask;
     imageWidth = newWidth;
     imageHeight = newHeight;
+    originalImage = std::move(newOriginal);
+    displayedFigureColor = originalImage.palette.fill;
     imageRightOffset = IMAGE_MARGIN;
     imageTopOffset = IMAGE_MARGIN;
 
@@ -663,6 +857,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             MoveImage(hWnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             StopDragging(hWnd);
+        }
+        return 0;
+    case WM_RBUTTONUP:
+        if (!dragging && HitTestImage(hWnd,
+            GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)))
+        {
+            ChooseFigureColor(hWnd);
         }
         return 0;
     case WM_CAPTURECHANGED:
